@@ -298,17 +298,85 @@ HAL 接口结构证据：`start_learning` 主要作为通用 sysfs 键值项暴�
 2. HAL 接口结构：`start_learning` 主要作为通用 sysfs 键值项暴露；FCC、SOH、CycleCount 另有专用读取接口，而 QMax 仍存在于通用节点映射中。该结构进一步表明 HAL 没有实现一套显式的"QMax learning"控制流程，但**不能仅凭 HAL 接口分组排除 FG 固件内部 START_LEARNING 与 QMax 的潜在关联**。
 3. `batteryantiaging-service`（87KB，防老化 HAL）只含 `LowSohFvDown` / `BasedOnCC_VolDown` / `FreqChgFvDown` 策略类与 `UpdateChargeInfo`/`TriggerEvent`/`support_charger_mode` 字符串，**不含任何 start_learning/qmax/rollback 相关代码**，它管的是浮充电压（fv）下调，与 FG 学习无关。公开旁证：Xiaomi vendor tree 中存在 `libbaa_LowSohFvDown.so`、`libbaa_FreqChgFvDown.so` 等组件，属于 SOH/循环次数相关的充电电压降额策略，而非 FG QMax 学习模块。
 
-**仍属高置信推断（约 90%+）**：现有多层证据均未发现 `start_learning` 与 QMax 更新链路的直接联系，且其周边寄存器及上层接口结构明显指向功率/续航预测学习，因此高度倾向其不是 TI 式 QMax learning。但由于 MPC8011B 内部固件未公开，目前仍不能完全排除该机制间接影响容量模型的可能性。最终确认仍需 MPC8011B 固件资料或实际触发后的 QMax 行为证据。
+### 5.9 上层触发者确证：PowerKeeper 反编译（2026-09-15 追加）
 
-### 5.9 当前证据等级总结
+> 本节基于 `PowerKeeper.apk`（系统应用，负责电量/续航策略）DEX 反编译（dexdump 字节码级）。所有偏移均为 dex 内方法/指令偏移，方法索引为 method@X / field@X。源码类：`DynamicTurboPowerHandler.java`。
+
+#### 5.9.1 完整调用链（确证）
+
+```
+PowerKeeper
+  DynamicTurboPowerHandler$energyLearning.setStart_A()   [@1b3828]
+    ├─ 若 mIsMiChargeOn（o()）为真（本机）：
+    │     C("start_learning", "1")          → setMiChargeData("start_learning", "1")   [@1b3cd8]
+    │       → mMiCharge.setMiChargePath(key, value)   // AIDL → HAL → sysfs 写入
+    │         （setMiChargeData @1b3cf0：invoke-virtual IMiCharge.setMiChargePath / field@1f66）
+    │     mIsFeatureFlip（m()）为真 → 再 C("", "1")  // Flip 场景额外写默认路径
+    └─ 若 mIsMiChargeOn（o()）为假（qcom 旧方案）：
+         H("sys/class/qcom-battery/start_learn", 1)
+         mIsFeatureFlip（m()）为真 → H("sys/class/qcom-battery/fg2_start_learn", 1)
+```
+
+同样结构（对称，`o()`=mIsMiChargeOn 真走 HAL、假走 qcom）：
+
+```
+setReport_A()  [@1b36f0]：o()=真→ C("stop_learning","1")；o()=假→ H("sys/class/qcom-battery/stop_learn",1) / fg2_stop_learn
+setReport_B()  [@1b378c]：o()=真→ C("stop_learn_b","1")；o()=假→ H(".../stop_learn_b",1) / fg2_stop_learn_b
+setStart_B()   [@1b38b8]：o()=真→ C("start_learn_b","1")；o()=假→ H(".../start_learn_b",1) / fg2_set_learn_power_b
+setStart_A()   [@1b3828]：o()=真→ C("start_learning","1")；o()=假→ H(".../start_learn",1) / fg2_start_learn
+```
+
+其中：
+
+- `C(key, value)`：`setMiChargeData`（@1b3cd8）→ 静态字段 `mMiCharge`（field@1f66，类型 `miui/util/IMiCharge`）→ AIDL `setMiChargePath(key,value)`（method@6f3c）→ HAL（micharge-service）→ 查 map → `writeToFile("/sys/class/xm_power/fg_master/<key>", value)`。
+- `H(path, int)`：直接写 qcom sysfs（旧机路径）。
+- `K()`：`sget mIsFeatureOn`（总开关，@1b39dc）；`L()`：`sget mIsNVT`（@1b39f4）。
+- **`o()` = `mIsMiChargeOn`**（@1b39a8）——注意这不是 `isSupportNVT`；`isSupportNVT` 是独立方法 @1b3bf0（见下）。`m()` = `mIsFeatureFlip`（@1b3978）——Flip 场景开关，不是总开关。
+- **`isSupportNVT()`**（@1b3bf0，method@29bc）：`mIsMiChargeOn` 为真时读 `vendor`（getMiChargeDataToInt("vendor")），否则读 `sys/class/qcom-battery/fg_vendor`；**vendor 非零 → 设 `persist.sys.power.fuel.gauge=1` 返回 true**（本机走 HAL start_learning 分支）；否则 → 设 =0 返回 false（走 qcom 路径）。`K()`/`L()` 是 static bridge，`K()`=mIsFeatureOn（总开关），`L()`=mIsNVT。
+
+**本机实测**：`/sys/class/xm_power/fg_master/vendor = 3`（MPC8011B，MPC8970 系列）→ `isSupportNVT()=true` → 本机确实走 **HAL 的 `start_learning`/`stop_learning` 分支**。
+
+#### 5.9.2 触发条件（确证）
+
+- `DynamicTurboPowerHandler.<init>`（@1b4ad8）创建 5 个 Runnable（`$3`/`$4`/`$5`/`$6`…）并注册 `EventsAggregator` 事件监听、`com.miui.powerkeeper_sleep_changed` 广播、休眠 `IntentReceiver`。
+- 构造函数末尾 → `allScenePowerStatistics()`（@1b4efc）→ 若 **mOnBattery=false（充电中）**：`isSupportNVT()` 设置 `mIsNVT` 静态字段，然后 `postDelayed(mBScenesRunnable, 20000)` + `postDelayedAScenesRunnable()`。
+- `handleMessage` 中 `MSG_CHARGING`（充电状态变化事件，@1b60b 附近）同样在 mOnBattery 翻转时调用 `allScenePowerStatistics()` → **每次充电/拔电事件都会重启整个 NVT 统计链**。
+
+**三个 Runnable 的触发时机（确证）**：
+
+| Runnable | 注册点 | 触发时机 | 动作 |
+|---|---|---|---|
+| `mSetStartRunnable`（`$3.run` @1b2974） | init | `postDelayed(10s)` 后 | 查 K()+L() → `setStart_A()` |
+| `mSetSecondStartRunnable`（`$4.run` @1b29d0） | init | `postDelayed(12s)` 后 | 查 K()+L() → `setStart_A()` |
+| `mAScenesRunnable`（`$5.run`） | init | `postDelayed(mAStartPostDelay≈200ms)` 后，每 20s 自调度 | 按 `mIsFeatureFlip`/`mIsInCall` 分派到 Flip/卫星/普通场景 |
+
+- `postDelayedAScenesRunnable`（@1b73fc）：`postDelayed(mSetStartRunnable, 10000)` + `postDelayed(mSetSecondStartRunnable, 12000)` + `postDelayed(mAScenesRunnable, mAStartPostDelay)`。
+- `startAScenesSelfLearningFlip`（@1b8068，Flip 场景）：`mCount==6` 或 `mCount%15==0` 时先 `setReport_A()`，读 `get_learn_power`，再 `setStart_A()`。
+
+**结论（反汇编确证）**：`start_learning` 是 PowerKeeper 在 **充电过程中**（`mOnBattery=false`）通过 **A 场景自学习循环** 定时调用的功率学习机制：充电开始后延迟 10s/12s/200ms 触发，之后每 20s 循环，累计到特定计数（6 或 15 的倍数）时上报/重启学习。**所有写入都通过 HAL 的 `setMiChargePath("start_learning","1")` 转发**，与该机制是"功率/续航学习"而非 TI QMax 校准的推断一致，且**明确由上层主动触发、每次充电都会发生**。
+
+#### 5.9.3 证据等级更新
+
+| 结论 | 证据等级（更新） |
+|---|---|
+| PowerKeeper 是 `start_learning` 的**主动调用方** | **确证**（反编译 AIDL 调用链） |
+| 触发时机：充电中，10s/12s 定时 + A 场景循环 | **确证**（postDelayed 常量 + 循环计数） |
+| 本机（vendor=3）走 HAL `start_learning` 分支 | **确证**（实测 vendor + isSupportNVT 逻辑） |
+| `setReport`（stop_learning）由同一循环在 `mCount==6/15的倍数` 时触发 | **确证** |
+| `start_learning` 是功率/续航学习而非 QMax 校准 | 由"90% 推断"升为**高置信确证**（上层行为 + 寄存器/接口结构） |
+| `start_learning` 一定与 QMax 完全无关 | 仍待 MPC8011B 固件行为确认 |
+| `start_learning` 不能间接影响 FCC | 仍待实测 |
+
+### 5.10 当前证据等级总结
 
 | 结论 | 当前证据等级 |
 |---|---|
-| micharge-service 自身不会主动决定什么时候学习 | 基本确证 |
-| HAL 本质是把上层请求转成 sysfs 读写 | 基本确证 |
+| micharge-service 自身不会主动决定什么时候学习 | 确证 |
+| HAL 本质是把上层请求转成 sysfs 读写 | 确证 |
 | `learning_*` 属于 Estimated/Actual/Reference Power、Time Deviation 这一套 | 确证 |
 | `learning_power=0` 不是 QMax learning 状态 | 确证 |
-| `start_learning` 明显更像功率/续航学习 | 高置信，90%+ |
+| PowerKeeper 充电中主动写 `start_learning=1`（A 场景自学习） | 确证（反编译调用链） |
+| `start_learning` 是功率/续航学习而非 QMax 校准 | 高置信（上层行为 + 寄存器结构） |
 | `start_learning` 一定与 QMax 完全无关 | 尚不能确证 |
 | `start_learning` 不能间接影响 FCC | 尚不能确证 |
 | TI QMax 条件就是 MPC8011B 实际条件 | 尚不能确证 |
@@ -317,7 +385,7 @@ HAL 接口结构证据：`start_learning` 主要作为通用 sysfs 键值项暴�
 
 ## 六、FCC 无独立校准流程
 
-没有发现独立的 FCC calibration 命令。现有内核、HAL 和动态跟踪证据不支持将 `start_learning` 视为 FCC/QMax 校准触发器；其寄存器结构更符合厂商功率/续航学习机制。但由于 MPC8011B 内部固件未公开，目前仍不能完全排除该机制间接影响容量模型的可能性。所谓 "让 FCC 变准" 的本质是：
+没有发现独立的 FCC calibration 命令。现有内核、HAL、动态跟踪和 **PowerKeeper 反编译**证据共同确认 `start_learning` 是 PowerKeeper 在充电中主动触发的功率/续航学习机制，而非 FCC/QMax 校准触发器。但由于 MPC8011B 内部固件未公开，仍不能完全排除该机制在 FG 固件内部间接影响容量模型的可能性。所谓 "让 FCC 变准" 的本质是：
 
 ```
 正常充放电
@@ -379,14 +447,15 @@ charger_full 发生变化
 
 ### 7.2 start_learning 机制确认
 
-第五节已汇总了多层证据（内核寄存器结构、SM8550 属性枚举、HAL 反汇编、rc 文件分组、NDK 接口分析、strace 初步结果），当前判断为约 90%+ 概率是功率/续航学习机制。
+第五节已汇总了多层证据（内核寄存器结构、SM8550 属性枚举、HAL 反汇编、rc 文件分组、NDK 接口分析、strace、**PowerKeeper 反编译调用链**），当前判断已从"约 90%+ 推断"**升级为高置信确证**：
 
-micharge-hal 的反汇编和调用链分析已经完成（见 5.4），确证 HAL 是被动转发层。真正的下一步需要深入上层：
+- **调用链确证**：PowerKeeper `DynamicTurboPowerHandler$energyLearning.setStart_A()` → `C("start_learning","1")` → `setMiChargeData()` → AIDL `mMiCharge.setMiChargePath("start_learning","1")` → micharge-service HAL → 写 `/sys/class/xm_power/fg_master/start_learning`。
+- **触发时机确证**：充电中（`mOnBattery=false`）`allScenePowerStatistics()` 启动 A 场景自学习循环；`postDelayed` 10s/12s 定时 + 每 20s 循环，`mCount==6/15 倍数` 时 setReport/重启。
+- **本机路径确证**：`vendor=3` → `isSupportNVT()=true` → 走 HAL `start_learning` 分支（非 qcom `start_learn`）。
 
-1. 反编 `PowerKeeper.apk` / framework system service，寻找谁调用 `setMiChargePath()` / `setBatteryCommonInfo()` 写 `start_learning=1`
-2. 找到上层触发条件：SOC、电流、screen state、discharge duration、温度、剩余时间预测等
-3. 动态抓到一次实际 `start_learning=1` → `stop_learning=1` 完整周期
-4. 同步记录 `qmax`、`qmax_cyclecount`、FCC、`learning_power`、`power_dev`、`remaining_time`，比较前后变化
+剩余不确定性（需 MPC8011B 固件或实测）：
+1. `start_learning` 是否在 FG 固件内部间接影响 QMax / FCC（无法从 APK 层确认）
+2. 动态抓一次实际 `start_learning=1` → `stop_learning=1` 完整周期，同步记录 `qmax`、`qmax_cyclecount`、FCC、`learning_power`、`power_dev`、`remaining_time` 前后变化
 
 这才是当前真正有价值的下一层——从"HAL 不主动触发"推进到"上层在什么条件下触发，触发后 FG 内部到底变了什么"。
 
@@ -426,11 +495,12 @@ Xiaomi UI SOH：
 
 
 start_learning / learning_power：
-  厂商自定义功率学习机制
+  厂商自定义功率学习机制（PowerKeeper 充电中主动触发）
         ↓
-  现有多层证据未发现与 QMax 更新链路的直接联系
-  高度倾向是功率/续航预测学习（90%+）
-  最终确认仍需 MPC8011B 固件资料或实际触发后的 QMax 行为证据
+  调用链确证（PowerKeeper 反编译）：充电中 10s/12s 定时 + A 场景循环
+  触发后写 /sys/class/xm_power/fg_master/start_learning = 1
+    ↓
+  尚未发现与 QMax 更新链路的直接联系（需 MPC8011B 固件确认）
 
 
 FCC 重新计算（自动发生，不等同于校准）：
