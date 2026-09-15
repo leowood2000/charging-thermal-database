@@ -114,7 +114,7 @@ FCC 的长期准确性主要依赖 QMax、Ra 和 SOC/OCV 模型的正常学习�
 
 QMax 更新需要**两次合格的 OCV（开路电压）读数**，分别在一次充/放电活动的前后、电池处于 RELAXED 状态时取得：
 
-- **RELAXED 判定**：电池电压 `dV/dt < 1 µV/s`；充满态通常需要**最多 2 小时**、放空态**最多 5 小时**才满足；超过 5 小时即使未满足也会取读数。
+- **RELAXED 判定**：电池电压 `dV/dt < 1 µV/s`；在传统 OCV 路径下，停止充电后通常最多约 **2 小时**、停止放电后通常最多约 **5 小时**才能满足该条件；若 5 小时后仍未满足，TI 算法也会取得一次读数。注意这里说的是"停止充电/放电后"的静置等待时间，不要求充到 100% 或放到 0%。
 - **两次静置之间必须有足够的充/放电活动**——TI 要求容量变化 **≥ 37%** 设计容量。
 
 以下任一条件成立会**取消**这次 QMax 更新：
@@ -170,8 +170,8 @@ adb shell "su -c 'for n in qmax qmax_cyclecount cyclecount charger_full soh soh_
 
 | 节点 | 权限 | 作用 |
 |---|---|---|
-| `start_learning`（及 `_b`） | `rw-rw-r-- system system` | 向电量计写 `0x01`，开启一次学习窗口 |
-| `stop_learning`（及 `_b`） | `rw-rw-r-- system system` | 结束学习窗口 |
+| `start_learning`（及 `_b`） | `rw-rw-r-- system system` | 向 `NVT_FG_REG_START_LEARNING` 写 `0x01`；用于厂商自定义 learning 机制，具体状态机语义未公开 |
+| `stop_learning`（及 `_b`） | `rw-rw-r-- system system` | 向 `NVT_FG_REG_STOP_LEARNING` 写 `0x01`；具体结束行为由厂商 FG 固件定义 |
 
 证据：`/vendor/etc/init/vendor.xiaomi.hardware.micharge-service.rc` 明确 `chown system system .../start_learning`、`.../stop_learning`；`micharge-hal`（本机 pid 1932，running）二进制中含这些路径与 `qmax`、`soh`、`ui_soh` 字符串。
 
@@ -216,23 +216,22 @@ charger_full 发生变化
 没必要放到自动关机，也不建议故意过度深放。可以做一次这样的周期：
 
 ```
-① 正常充到 100%
-   ↓ 继续等到真正停止充电/显示 FULL
-   ↓ 拔电，屏幕关闭静置约 2 小时
-
-② 正常使用放到约 30～40%
-   （100→40 已远大于 37%）
-   ↓ 屏幕关闭、不要充电，长时间静置
-   ↓ 理想情况下约 5 小时
-
-③ 再正常充到 100%
-   ↓ 等待真正充电终止
-   ↓ 拔电，再静置约 2 小时
+100% / 正常高 SOC
+  ↓
+停止充电，静置约 2h → 取得 OCV1
+  ↓
+正常放电至 30~40%（容量变化 >37%）
+  ↓
+停止使用，静置最长按约 5h 考虑 → 取得 OCV2
+  ↓
+可能发生 QMax update → FCC 随新 QMax/Ra 模型重算
+  ↓
+再充满 → Valid Charge Termination → FCC 再次重算
 ```
 
-整个过程中尽量保持 20～30℃，不要边充边打游戏，不要为了校准把手机放到高温环境。
+不需要放到 0%，也不需要把"再次充到 100%"当成第一次 QMax 更新的必要条件。步骤①②已构成一次完整的 QMax 更新机会；步骤③是额外收益。
 
-这比 "0%→100% 完整循环" 更符合 Impedance Track 的实际工作方式：步骤①③提供合格 OCV，步骤②提供 ≥37% 的容量变化并同时给 Ra grid 更新机会。
+这比 "0%→100% 完整循环" 更符合 Impedance Track 的实际工作方式：步骤①静置提供 OCV1；步骤②完成 ≥37% 放电后再次静置提供 OCV2，此时已满足普通 QMax 更新所需的两次 OCV 基本结构，同时放电过程也给 Ra grid 更新机会。步骤③重新充满并静置可继续提供下一次 OCV，同时有效充电终止也会触发 FCC 重算——但步骤③不是第一次 QMax 更新的必要条件。
 
 ### 什么情况不会触发 QMax 更新
 
