@@ -66,9 +66,9 @@
 | `tremq` | 2605 | TRemQ 内部剩余容量 | 比 rm(2521) 略高，同样可能是内部模型值 |
 | `tsim` | 3052 | ITStatus1 内部温度/模拟字段 | 私有，具体定义未公开 |
 | `tambinet` | 65232 | Ambient Temperature（源码拼写错误） | ITStatus1 厂商字段，私有 raw |
-| `avercurrent` | 93 | FG AverageCurrent | mA（非 µA） |
-| `average_current` | 93 | NVT/MPC 10 秒平均电流 | mA |
-| `average_temperature` | 63096 | NVT/MPC 10 秒平均温度 | 私有 raw |
+| `avercurrent` | 93 | MPC/NVT 平均电流 | 与 average_current 实际映射至同一属性 FG_IC_PROP_AVERAGE_CURRENT，驱动未走标准 BQ AverageCurrent 读取函数 |
+| `average_current` | 93 | MPC/NVT 平均电流 | 驱动注释为 10s average current |
+| `average_temperature` | 63096 | NVT/MPC 10 秒平均温度 | 疑似驱动单位兼容问题，见下方注释 |
 | `calc_rvalue` | 0 | 综合 R-value | 0 可能表示未计算/不支持 |
 | `batt_use_environment` | 0 0 253 25 0 0 7 0 187 31 0 0 177 0 17 3 0 0 0 0 20 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | 电池使用环境数据块 | 私有 38 字节 |
 
@@ -81,7 +81,15 @@
 | `rm` | 2521 mAh | 驱动从 FG 寄存器读取后 ×1000 输出（µAh） |
 | `tremq` | 2605 | 驱动从 ITStatus1 直接取的原始值 |
 
-tfullchgq 和 tremq 与 charger_full/rm 之间分别有约 38 mAh 的差值。这可能对应 FG 内部不同计算路径（TI 标准 MAC vs NVT/MPC 私有 ITStatus 块），或者两条路径的更新时机不同。
+tfullchgq 和 tremq 与 charger_full/rm 之间的差值分别约为 38 mAh 和 84 mAh。这可能对应 FG 内部不同计算路径（标准 FCC/RM 寄存器路径 vs MPC8011B 的 ITStatus1 数据块），或者两条路径的更新时机不同。
+
+### avercurrent 与 average_current 同源
+
+源码注册表中 `avercurrent` 和 `average_current` 均绑定到 `FG_IC_PROP_AVERAGE_CURRENT`，最终都调用 `fg_get_average_current()` 读取 NVT_FG_AVE_CUR（10s average current）。两个节点值相同（93）并非巧合，而是同一 MPC/NVT 字段。驱动中虽存在 `fg_read_avercurrent()`（读标准 BQ_FG_REG_AVER_CURRENT 并 ×1000），但当前 sysfs 注册未走该函数。
+
+### average_temperature=63096 疑似驱动单位兼容问题
+
+`average_temperature` 源码使用 u16 并执行 `ave_temp = ave_temp - 2730`。63096 疑似 unsigned 16-bit 下溢：反推 `(63096 + 2730) mod 65536 = 290`，与实时温度 `temp=291`（29.1°C）高度吻合。可能是 MPC8011B 的 NVT_FG_AVE_TEMP 已直接返回 0.1°C，而共用驱动仍按 0.1K 做 Kelvin→Celsius 转换，导致 u16 下溢。此为强推断，尚未确证。
 
 ---
 
@@ -120,12 +128,12 @@ tfullchgq 和 tremq 与 charger_full/rm 之间分别有约 38 mAh 的差值。�
 | `count_level2` | 0 | 第2档累计 | 未触发 |
 | `count_level3` | 0 | 第3档累计 | 未触发 |
 | `count_lt` | 0 | 低温使用累计 | 未触发 |
-| `rel_soh` | 0 | Relative SOH | 当前返回 0，可能未启用/未实现/无有效值 |
+| `rel_soh` | 0 | Xiaomi/MPC 扩展 REL_SOH | 当前返回 0，可能未启用/未实现/无有效值 |
 | `rel_soh_cyclecount` | 0 | rel_soh 循环计数 | 同上 |
-| `eis_soh` | 0 | EIS SOH | 当前返回 0，可能未启用/未实现/无有效值 |
+| `eis_soh` | 0 | Xiaomi/MPC 扩展 EIS_SOH | 当前返回 0，可能未启用/未实现/无有效值 |
 | `eis_soh_cyclecount` | 0 | EIS SOH 循环计数 | 同上 |
 
-**rel_soh / eis_soh / fcc_soh 全为 0**：这三个 TI 兼容 SOH 指标在 MPC8011B 上当前均返回 0，可能未启用、未实现或无有效值，尚不能确证 MPC8011B 不支持 TI 多 SOH 体系。
+**rel_soh / eis_soh / fcc_soh 全为 0**：fcc_soh（TI/BQ 兼容 FCC_SOH）当前返回 0；rel_soh（Xiaomi/MPC 扩展 REL_SOH）和 eis_soh（Xiaomi/MPC 扩展 EIS_SOH）也返回 0。三者均可能未启用、未实现或无有效值，尚不能确证 MPC8011B 不支持相关功能。
 
 ---
 
@@ -148,7 +156,7 @@ tfullchgq 和 tremq 与 charger_full/rm 之间分别有约 38 mAh 的差值。�
 
 time_ht=0、time_ot=0、over_vol_duration=0，可能是未触发或未支持/未记录，不能仅凭 0 值判断温度管理状态。max_life_temp=44（厂商 raw，可能对应 44°C）在手机充电场景中属于正常偏高范围。
 
-max_life_vol=4519 mV 和 min_life_vol=2883 mV 均在锂电池安全区间内（典型 4.5V 上限和 2.8V 下限）。
+max_life_vol=4519 mV 和 min_life_vol=2883 mV 记录了电芯历史电压极值。未据此判断是否触及电芯保护阈值，需结合电芯规格和 Data Flash 配置确认。
 
 ---
 
@@ -173,7 +181,7 @@ max_life_vol=4519 mV 和 min_life_vol=2883 mV 均在锂电池安全区间内（�
 | `action_power_b` | 0 | B 组 Actual Power |
 | `learning_power_dev_b` | 0 | B 组功率偏差 |
 
-采集时设备正在低电流充电（ibatt=289000 µA），但该组 learning 节点均为 0。说明正在充电并不等于自动触发 start_learning。单次静态快照不足以判断其触发条件，也不能据此认定其仅在充电或放电时工作。
+采集时设备正在低电流充电（ibatt=289000 µA），但该组 learning 节点均为 0。start_learning 的写入实现为 `fg_write_byte(... START_LEARNING, 0x01)`，可能是脉冲/触发型命令——即便此前曾被写过 1，稍后读取也完全可能重新为 0。因此本次快照最多证明采集时读取值为 0，不能排除此前曾发生过短暂的 learning 触发。单次静态快照不足以判断其触发条件，也不能据此认定其仅在充电或放电时工作。
 
 详见《电池容量校准与SOH.md》第五节对 start_learning 机制的完整分析。
 
@@ -218,9 +226,9 @@ qmax_cyclecount: 280  (与 cyclecount 差 110，精确语义未确认)
 | `soh` | 100 | MPC8011B 标准 SOH 寄存器返回值，算法未公开 | 是（标准寄存器） |
 | `soh_new` | 97 | Xiaomi UI SOH 缓存 | 是（厂商私有） |
 | `ui_soh` | 97 119 1 2 ... | MAC 0x007B 11 字节块 | 是（厂商私有） |
-| `fcc_soh` | 0 | TI FCC_SOH | 当前返回 0，可能未启用/未实现 |
-| `rel_soh` | 0 | TI Relative SOH | 当前返回 0，可能未启用/未实现 |
-| `eis_soh` | 0 | TI EIS SOH | 当前返回 0，可能未启用/未实现 |
+| `fcc_soh` | 0 | TI/BQ 兼容 FCC_SOH | 当前返回 0，可能未启用/未实现/无有效值 |
+| `rel_soh` | 0 | Xiaomi/MPC 扩展 REL_SOH | 当前返回 0，可能未启用/未实现 |
+| `eis_soh` | 0 | Xiaomi/MPC 扩展 EIS_SOH | 当前返回 0，可能未启用/未实现 |
 
 ### 容量数据交叉验证
 
@@ -330,4 +338,4 @@ vendor = 3
 - 节点路径：`/sys/class/xm_power/fg_master/`
 - 本快照为静态采集，功率学习等动态参数在充电/放电场景下会变化
 - 节点含义和 MPC8011B 私有语义解释基于 Xiaomi 开源驱动代码，部分含义为推断
-- `fcc_soh`/`rel_soh`/`eis_soh` 当前返回 0，可能未启用/未实现/无有效值，尚不能确证 MPC8011B 不支持 TI 多 SOH 体系
+- `fcc_soh`（TI/BQ 兼容）和 `rel_soh`/`eis_soh`（Xiaomi/MPC 扩展）当前返回 0，可能未启用/未实现/无有效值，尚不能确证 MPC8011B 不支持相关功能
