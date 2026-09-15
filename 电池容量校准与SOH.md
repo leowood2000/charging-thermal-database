@@ -271,12 +271,14 @@ rel_soh_cyclecount / eis_soh_cyclecount
 
 ### 5.6 HAL 侧：NDK 接口定义
 
-HAL 的 NDK 接口库 `vendor.xiaomi.hardware.micharge-V2-ndk.so` 导出的 AIDL 方法列表中，`start_learning` 等节点通过通用键值接口访问，而非专门方法：
+HAL 的 NDK 接口库 `vendor.xiaomi.hardware.micharge-V2-ndk.so` 导出的 AIDL 方法列表中，部分容量指标有专用 convenience getter，而 `start_learning` 等节点通过通用键值接口访问：
 
+- `getBatteryChargeFull()` / `getBatterySoh()` / `getBatteryCycleCount()`：FCC/SOH/CycleCount 的专用读取方法
+- `getMiChargePath(path)` / `setMiChargePath(path, value)`：通用 sysfs 路径读写
 - `getBatteryCommonInfo(key)` / `setBatteryCommonInfo(key, value)`：通用键值读写，`start_learning` 等功率学习节点通过此接口操作
-- `getBatteryChargeFull()` / `getBatterySoh()` / `getBatteryCycleCount()`：独立的 QMax/FCC/SOH 读取方法
+- 注意：公开 AIDL 中**没有** `getBatteryQmax()` 之类的 QMax 专用方法，QMax 仍存在于通用节点映射中
 
-这说明 QMax/FCC/SOH 与功率学习在 HAL 接口层面也是分离的。反汇编进一步确认：`getBatterySoh` 等专用方法内部仍是查同一张 109 节点 map 读路径，不存在独立的学习触发逻辑。
+HAL 接口结构证据：`start_learning` 主要作为通用 sysfs 键值项暴露；FCC、SOH、CycleCount 另有专用读取接口，而 QMax 仍存在于通用节点映射中。该结构进一步表明 HAL 没有实现一套显式的"QMax learning"控制流程，但**不能仅凭 HAL 接口分组排除 FG 固件内部 START_LEARNING 与 QMax 的潜在关联**。反汇编进一步确认：`getBatterySoh` 等专用方法内部仍是查同一张 109 节点 map 读路径，不存在独立的学习触发逻辑。
 
 ### 5.7 动态追踪：strace 初步结果
 
@@ -293,21 +295,29 @@ HAL 的 NDK 接口库 `vendor.xiaomi.hardware.micharge-V2-ndk.so` 导出的 AIDL
 
 **确证（反汇编级）**：
 1. **micharge-service 是被动转发层**：`start_learning`/`stop_learning`/`enable_rollback` 等节点只是它 map 里的读写项，由上层 AIDL 调用触发，**HAL 自身不主动写**。
-2. `start_learning` 系节点在 HAL 中与 QMax/SOH 节点分属不同访问路径（一组走 `setMiChargePath` 通用键值、一组走 `getBatterySoh` 等专用方法），**接口层面学习与 QMax 分离**。
-3. `batteryantiaging-service`（87KB，防老化 HAL）只含 `LowSohFvDown` / `BasedOnCC_VolDown` / `FreqChgFvDown` 策略类与 `UpdateChargeInfo`/`TriggerEvent`/`support_charger_mode` 字符串，**不含任何 start_learning/qmax/rollback 相关代码**，它管的是浮充电压（fv）下调，与 FG 学习无关。
+2. HAL 接口结构：`start_learning` 主要作为通用 sysfs 键值项暴露；FCC、SOH、CycleCount 另有专用读取接口，而 QMax 仍存在于通用节点映射中。该结构进一步表明 HAL 没有实现一套显式的"QMax learning"控制流程，但**不能仅凭 HAL 接口分组排除 FG 固件内部 START_LEARNING 与 QMax 的潜在关联**。
+3. `batteryantiaging-service`（87KB，防老化 HAL）只含 `LowSohFvDown` / `BasedOnCC_VolDown` / `FreqChgFvDown` 策略类与 `UpdateChargeInfo`/`TriggerEvent`/`support_charger_mode` 字符串，**不含任何 start_learning/qmax/rollback 相关代码**，它管的是浮充电压（fv）下调，与 FG 学习无关。公开旁证：Xiaomi vendor tree 中存在 `libbaa_LowSohFvDown.so`、`libbaa_FreqChgFvDown.so` 等组件，属于 SOH/循环次数相关的充电电压降额策略，而非 FG QMax 学习模块。
 
-**仍属高置信推断（约 90%+）**：`start_learning` 大概率是 NVT/MPC 电量计的功率/续航预测学习机制，而非 TI Impedance Track 的 QMax learning。该推断现在主要依赖**代码结构证据**（寄存器组、属性枚举分组、路径分离），要完全坐实"学习的具体效果与 QMax 的关系"，需要 FG 固件或厂商文档。
+**仍属高置信推断（约 90%+）**：现有多层证据均未发现 `start_learning` 与 QMax 更新链路的直接联系，且其周边寄存器及上层接口结构明显指向功率/续航预测学习，因此高度倾向其不是 TI 式 QMax learning。但由于 MPC8011B 内部固件未公开，目前仍不能完全排除该机制间接影响容量模型的可能性。最终确认仍需 MPC8011B 固件资料或实际触发后的 QMax 行为证据。
 
-**消除剩余不确定性的下一步（优先级排序）**：
-1. 用 Ghidra 反编译 `PowerKeeper.apk` / 系统服务，找谁在 AIDL 层调用 `setBatteryCommonInfo("start_learning", "1")` 及其触发条件（当前最有价值）
-2. 在充放电场景下长时间 strace 抓 HAL 写 `start_learning` 的时间序列
-3. 结合 sysfs 实时监控，观察 `start_learning` 触发时 `qmax` / `qmax_cyclecount` 是否同步变化
+### 5.9 当前证据等级总结
+
+| 结论 | 当前证据等级 |
+|---|---|
+| micharge-service 自身不会主动决定什么时候学习 | 基本确证 |
+| HAL 本质是把上层请求转成 sysfs 读写 | 基本确证 |
+| `learning_*` 属于 Estimated/Actual/Reference Power、Time Deviation 这一套 | 确证 |
+| `learning_power=0` 不是 QMax learning 状态 | 确证 |
+| `start_learning` 明显更像功率/续航学习 | 高置信，90%+ |
+| `start_learning` 一定与 QMax 完全无关 | 尚不能确证 |
+| `start_learning` 不能间接影响 FCC | 尚不能确证 |
+| TI QMax 条件就是 MPC8011B 实际条件 | 尚不能确证 |
 
 ---
 
 ## 六、FCC 无独立校准流程
 
-FCC 没有独立的校准命令，也不能通过 `start_learning` 触发。所谓 "让 FCC 变准" 的本质是：
+没有发现独立的 FCC calibration 命令。现有内核、HAL 和动态跟踪证据不支持将 `start_learning` 视为 FCC/QMax 校准触发器；其寄存器结构更符合厂商功率/续航学习机制。但由于 MPC8011B 内部固件未公开，目前仍不能完全排除该机制间接影响容量模型的可能性。所谓 "让 FCC 变准" 的本质是：
 
 ```
 正常充放电
@@ -369,12 +379,16 @@ charger_full 发生变化
 
 ### 7.2 start_learning 机制确认
 
-第五节已汇总了多层证据（内核寄存器结构、SM8550 属性枚举、HAL strings 聚类、rc 文件分组、NDK 接口分离、strace 初步结果），当前判断为约 90%+ 概率是功率/续航学习机制。
+第五节已汇总了多层证据（内核寄存器结构、SM8550 属性枚举、HAL 反汇编、rc 文件分组、NDK 接口分析、strace 初步结果），当前判断为约 90%+ 概率是功率/续航学习机制。
 
-要消除剩余不确定性，优先级最高的操作：
-1. 用 Ghidra 反编译 micharge-hal，追踪 `start_learning` 的 XREF 调用链和 caller 条件判断
-2. 在充放电场景下长时间 strace，抓取 HAL 实际写 `start_learning` 的时间序列和前后访问的节点
-3. 结合 sysfs 实时监控，观察 `start_learning` 触发时 `qmax` / `qmax_cyclecount` 是否同步变化
+micharge-hal 的反汇编和调用链分析已经完成（见 5.4），确证 HAL 是被动转发层。真正的下一步需要深入上层：
+
+1. 反编 `PowerKeeper.apk` / framework system service，寻找谁调用 `setMiChargePath()` / `setBatteryCommonInfo()` 写 `start_learning=1`
+2. 找到上层触发条件：SOC、电流、screen state、discharge duration、温度、剩余时间预测等
+3. 动态抓到一次实际 `start_learning=1` → `stop_learning=1` 完整周期
+4. 同步记录 `qmax`、`qmax_cyclecount`、FCC、`learning_power`、`power_dev`、`remaining_time`，比较前后变化
+
+这才是当前真正有价值的下一层——从"HAL 不主动触发"推进到"上层在什么条件下触发，触发后 FG 内部到底变了什么"。
 
 ---
 
@@ -414,7 +428,9 @@ Xiaomi UI SOH：
 start_learning / learning_power：
   厂商自定义功率学习机制
         ↓
-  目前无证据证明 = QMax Learning
+  现有多层证据未发现与 QMax 更新链路的直接联系
+  高度倾向是功率/续航预测学习（90%+）
+  最终确认仍需 MPC8011B 固件资料或实际触发后的 QMax 行为证据
 
 
 FCC 重新计算（自动发生，不等同于校准）：
