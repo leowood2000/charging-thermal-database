@@ -227,60 +227,20 @@ XM_PROP_FG1_FCC_SOH,
 
 > 源码依据：LineageOS SM8550 `qti_battery_charger.c`
 
-### 5.4 HAL 侧：micharge-hal 二进制 strings 实测
+### 5.4 HAL 侧：micharge-service 反汇编确证（2026-09-15 追加）
 
-对本机 `/vendor/bin/hw/vendor.xiaomi.hardware.micharge-service`（119472 字节，AARCH64 PIE）做 strings 提取（631 条），关键发现：
+对本机 `/vendor/bin/hw/vendor.xiaomi.hardware.micharge-service`（119472 字节，AARCH64 PIE，剥离符号）做了完整反汇编分析：
 
-**功率学习相关字符串聚类（在 strings 输出中紧密相邻）：**
+- `.gnu_debugdata` 解出完整符号表（14728 字节），确认服务为 `aidl::vendor::xiaomi::hardware::micharge::MiCharge`，所有 AIDL 方法为 **get/set 型被动接口**（`getBatterySoh`、`getBatteryChargeFull`、`getBatteryCycleCount`、`getMiChargePath`、`setMiChargePath`、`setBatteryCommonInfo` 等）。
+- **节点映射表**（`_GLOBAL__sub_I` 构建，`0x1ca50` 的 unordered_map）：109 个 sysfs 路径全部被装入 map，key 是节点名短串，value 是完整路径。包括：
+  - 学习组：`start_learning`、`stop_learning`、`start_learning_b`、`stop_learning_b`、`learning_power`、`learning_power_b`、`learning_power_dev`、`learning_power_dev_b`、`learning_time_dev`、`action_power`、`constant_power`、`remaining_time`、`referance_power`、`referance_current`、`nvt_referance_power`
+  - 容量/SOH 组：`qmax`、`qmax_cyclecount`、`soh`、`ui_soh`、`rel_soh`、`rel_soh_cyclecount`、`eis_soh`、`eis_soh_cyclecount`、`cyclecount`、`design_capacity`、`batt_sn`、`manufacturing_date` 等
+  - 其余：`fast_charge`、`soc_decimal`、`reverse_chg_mode`、`wireless_ctrl_limit` 等
+- **核心写路径 `setMiChargePath` @ 0xb788**：查 map → 找到路径 → 调 `writeToFile`（0x8d18，open/write 封装）。`setBatteryCommonInfo`/`setChargeCommonInfo` 等最终都走这条通用键值路径。
+- **后台线程 `thread_func` @ 0x8fe4 + `do_work` @ 0x8e24**：只做 CPU 负载监测与节流（RUN_US 计算、定时器 `timer_hanlder` 置标志），**没有任何主动写学习节点的逻辑**。
+- **`o1gUpgradeThread` @ 0xc064**：处理 o1g 固件升级（`PhoneBatteryChanged`/`screenStateChanged`/`startSendFirmFile` 等），全程无学习相关字符串引用。
 
-```
-start_learning
-stop_learning
-remaining_time
-nvt_referance_power
-nvt_referance_current
-referance_power
-referance_current
-constant_power
-action_power
-learning_power
-learning_power_dev
-learning_time_dev
-power_deviation
-current_deviation
-calc_rvalue
-```
-
-**HAL 内部函数名（直接可见）：**
-
-```
-Entry set_cycle_power function, tid is %d    ← set_cycle_power 入口
-set_cycle_power function is exitd!            ← set_cycle_power 退出
-Entry unset_cycle_power                       ← unset_cycle_power 入口
-set_learn_power                               ← 设置学习功率
-get_learn_power                               ← 读取学习功率
-get_learn_power_dev                           ← 读取功率偏差
-get_learn_power_dev_b
-get_learn_time_dev                            ← 读取时间偏差
-start_learn_b / stop_learn_b
-learn_power_b
-screenStateChanged                            ← 屏幕状态变化（疑似触发条件之一）
-```
-
-**QMax/SOH 相关字符串（存在于 HAL 中，但通过不同路径访问）：**
-
-```
-/sys/class/xm_power/fg_master/qmax
-/sys/class/xm_power/fg_master/qmax_cyclecount
-/sys/class/xm_power/fg_master/soh
-/sys/class/xm_power/fg_master/ui_soh
-/sys/class/xm_power/fg_master/rel_soh
-/sys/class/xm_power/fg_master/eis_soh
-/sys/class/xm_power/fg_master/cyclecount
-/sys/class/power_supply/battery/charge_full
-```
-
-**关键观察**：HAL 二进制中 `start_learning` 周围**没有出现**任何 TI QMax 学习相关字符串（`relax`、`ocv`、`QEN`、`VOK`、`GaugingStatus`、`impedance`、`ra_table`），而全部是功率/时间/偏差/参考电流等功率学习参数。
+**结论（反汇编确证）**：micharge-service 是**纯被动转发层**——它暴露了 `start_learning`/`stop_learning`/`enable_rollback` 等节点的读写能力，但**自身从不主动触发学习**。谁在何时写这些节点，取决于上层（PowerKeeper/系统服务）通过 AIDL 调用 `setMiChargePath(key, value)`。
 
 ### 5.5 HAL 侧：init rc 文件分组证据
 
@@ -316,7 +276,7 @@ HAL 的 NDK 接口库 `vendor.xiaomi.hardware.micharge-V2-ndk.so` 导出的 AIDL
 - `getBatteryCommonInfo(key)` / `setBatteryCommonInfo(key, value)`：通用键值读写，`start_learning` 等功率学习节点通过此接口操作
 - `getBatteryChargeFull()` / `getBatterySoh()` / `getBatteryCycleCount()`：独立的 QMax/FCC/SOH 读取方法
 
-这说明 QMax/FCC/SOH 与功率学习在 HAL 接口层面也是分离的。
+这说明 QMax/FCC/SOH 与功率学习在 HAL 接口层面也是分离的。反汇编进一步确认：`getBatterySoh` 等专用方法内部仍是查同一张 109 节点 map 读路径，不存在独立的学习触发逻辑。
 
 ### 5.7 动态追踪：strace 初步结果
 
@@ -325,89 +285,23 @@ HAL 的 NDK 接口库 `vendor.xiaomi.hardware.micharge-V2-ndk.so` 导出的 AIDL
 - HAL 仅反复读取 `reverse_chg_mode`、`fast_charge`、`real_type`（轮询充电状态）
 - **未观察到**对 `start_learning`、`learning_power`、`qmax`、`charger_full` 等节点的访问
 
-这说明 `start_learning` 不是 HAL 的常规轮询节点，而是在特定条件下（如 `set_cycle_power` 被调用、`screenStateChanged` 触发等）才会访问。
+这与 5.4 反汇编结论一致：HAL 后台线程只轮询充电状态，不主动触碰学习节点。
 
-### 5.8 结论
+### 5.8 结论（更新为反汇编确证版）
 
-综合内核寄存器结构、SM8550 属性枚举分组、HAL 二进制 strings 聚类、rc 文件分组、NDK 接口分离和动态追踪，判断更新为：
+综合内核寄存器结构、SM8550 属性枚举分组、HAL **反汇编**（非仅 strings）、rc 文件分组、NDK 接口分离和动态追踪，判断更新为：
 
-**大概率（约 90%+）`start_learning` 是 NVT/MPC 电量计的功率/续航预测学习机制，而非 TI Impedance Track 的 QMax learning。**
+**确证（反汇编级）**：
+1. **micharge-service 是被动转发层**：`start_learning`/`stop_learning`/`enable_rollback` 等节点只是它 map 里的读写项，由上层 AIDL 调用触发，**HAL 自身不主动写**。
+2. `start_learning` 系节点在 HAL 中与 QMax/SOH 节点分属不同访问路径（一组走 `setMiChargePath` 通用键值、一组走 `getBatterySoh` 等专用方法），**接口层面学习与 QMax 分离**。
+3. `batteryantiaging-service`（87KB，防老化 HAL）只含 `LowSohFvDown` / `BasedOnCC_VolDown` / `FreqChgFvDown` 策略类与 `UpdateChargeInfo`/`TriggerEvent`/`support_charger_mode` 字符串，**不含任何 start_learning/qmax/rollback 相关代码**，它管的是浮充电压（fv）下调，与 FG 学习无关。
 
-要将剩余不确定性消除到接近 100%，还需要：
-- 用 Ghidra 反编译 micharge-hal，找到 `start_learning` 字符串的 XREF，追踪其 caller 和条件判断逻辑
-- 或在充放电场景下长时间 strace，抓到 HAL 实际写 `start_learning` 的时间序列和前后访问的节点
+**仍属高置信推断（约 90%+）**：`start_learning` 大概率是 NVT/MPC 电量计的功率/续航预测学习机制，而非 TI Impedance Track 的 QMax learning。该推断现在主要依赖**代码结构证据**（寄存器组、属性枚举分组、路径分离），要完全坐实"学习的具体效果与 QMax 的关系"，需要 FG 固件或厂商文档。
 
-### 5.9 后续求证方法
-
-**方法一：Ghidra 静态反编译**
-
-```bash
-# 已拉取的二进制
-vendor.xiaomi.hardware.micharge-service  # 119472 bytes, AARCH64 PIE
-
-# Ghidra 分析步骤
-# 1. 导入：AARCH64 / ARM64 little endian
-# 2. Search → For Strings → 搜索 "start_learning"
-# 3. 找到后 → References → Show References To
-# 4. 追踪调用链：writeSysfs("/sys/.../start_learning", "1") → caller → 条件判断
-# 5. 重点看 caller 中是否有 qmax/ocv/relax/ra 相关路径
-```
-
-关键判断标准：
-
-| 反编译发现 | 对 QMax 关联的证据强度 |
-|---|---|
-| `qmax` / `qmax_cyclecount` 路径 | 强 |
-| `fcc` / `charger_full` | 中等 |
-| `ocv` / `relax` / `relaxed` | 强 |
-| `GaugingStatus` / `QEN` / `VOK` | 非常强 |
-| `DOD` / `passed charge` / `Ra table` | 强 |
-| 温度 10~40℃ 判断 | 中等 |
-| SOC Δ / capacity delta 判断 | 强 |
-| 只看到 power / time / reference current | **反向证据很强** |
-
-**方法二：动态 strace 长时间跟踪**
-
-```bash
-# 找 PID
-adb shell su -c 'pidof vendor.xiaomi.hardware.micharge-service'
-
-# 跟踪文件读写
-adb shell su -c '
-  strace -ff \
-    -e trace=openat,read,write \
-    -s 256 \
-    -p $(pidof vendor.xiaomi.hardware.micharge-service) \
-    -o /data/local/tmp/micharge_trace
-'
-
-# 正常使用手机一段时间后拉取
-adb pull /data/local/tmp/micharge_trace.<pid>
-```
-
-**方法三：sysfs 实时监控（不修改任何寄存器）**
-
-```bash
-adb shell su -c '
-while true; do
-    echo -n "$(date +%H:%M:%S) "
-    for n in \
-        qmax qmax_cyclecount cyclecount charger_full soh soh_new \
-        start_learning stop_learning learning_power learning_power_dev \
-        learning_time_dev remaining_time referance_power referance_current \
-        action_power constant_power power_deviation current_deviation
-    do
-        printf "%s=" "$n"
-        cat /sys/class/xm_power/fg_master/$n 2>/dev/null
-        printf " "
-    done
-    echo
-    sleep 5
-done
-'
-```
-
-不主动 `echo 1 > start_learning`，先观察系统自然触发。
+**消除剩余不确定性的下一步（优先级排序）**：
+1. 用 Ghidra 反编译 `PowerKeeper.apk` / 系统服务，找谁在 AIDL 层调用 `setBatteryCommonInfo("start_learning", "1")` 及其触发条件（当前最有价值）
+2. 在充放电场景下长时间 strace 抓 HAL 写 `start_learning` 的时间序列
+3. 结合 sysfs 实时监控，观察 `start_learning` 触发时 `qmax` / `qmax_cyclecount` 是否同步变化
 
 ---
 
