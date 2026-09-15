@@ -6,6 +6,7 @@ Redmi K80 Pro（miro）充电热控完整数据库，全部数据来自设备本
 
 - `无线充电热控数据库.md`：无线充电热控完整数据库（温度→等级→电流/功率、充电场景对比、虚拟温度公式、场景清单）
 - `有线充电热控数据库.md`：有线充电热控数据库（等级→电流表、快充协议矩阵、Quick Charge 电压/电流阶段曲线、SIC-BAT 温度→电流、MONITOR-BAT 电池等级、场景概览、实测验证）
+- `截止电压与关机电压.md`：电池级截止参数（JEITA 充电终止电压/电流、dod/cc 放电截止与关机电压表、循环寿命→关机电压关系、本机验证命令、改动风险）
 
 ## 数据链路（有线与无线共用）
 
@@ -19,6 +20,8 @@ Redmi K80 Pro（miro）充电热控完整数据库，全部数据来自设备本
 
 - 等级→电流：设备树 `mca_charger_thermal/wired_thermal` / `wireless_thermal`
 - 有线 Quick Charge 曲线：设备树 `mca_strategy_quick_charge` / `mca_quick_charge_batt_para_gbl`（每点为电压、current_max、current_min）
+- 充电终止电压（JEITA）：设备树 `mca_buckchg_jeita/jeita_para`、`jeita_para_ffc`；过压保护 `mca_vbat_ovp_mon`
+- 放电截止/关机电压：设备树 `strategy-fg`（`vcutoff_fw`、`vcutoff_shutdown_delay`、`vcutoff_sw`、`dod_para0~4`、`cc_para0/1`）；逻辑在 `/vendor/lib/modules/mca_strategy_fg_comp.ko`
 - 电池抗老化叠加配置：`/odm/etc/charger/BAA_config_miro.json`；该配置的浮充/终止策略不等同于主热控限流表
 - 温度→等级：`/vendor/etc/thermal-map.conf` + `/odm/etc/thermal-*.conf`
 - 配置文件为 AES-128-CBC 加密，key/IV = `thermalopenssl.h`（工具：helloklf/vtools mi-thermal-config / hdzungx/ThermalMunch）
