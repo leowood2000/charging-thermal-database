@@ -1,41 +1,99 @@
 # 电池容量校准与 SOH（K80 Pro / miro）
 
-> 本文同样是**电池级（Fuel Gauge）**参数，与有线/无线充电路径无关：`charge_full`（满充容量）不是厂商写死的标称值，而是电量计"学"出来的结果。
+> 本文是**电池级（Fuel Gauge）**参数分析，与有线/无线充电路径无关。
 
 > 数据来源（本机实时读取，2026-09-15 实测）：
 > - `/sys/class/xm_power/fg_master/*`：电量计原始量（`qmax`、`qmax_cyclecount`、`cyclecount`、`charger_full`、`soh`、`ui_soh`、`design_capacity` 等），由 `bq27z561.ko` 驱动导出
 > - `/sys/class/power_supply/battery/uevent`：Android 上报值（`CHARGE_FULL`、`CYCLE_COUNT` 等）
 > - 内核源码：`drivers/power/supply/mca/`（`mca_business/business_battery/mca_battery_psy.c`、`mca_strategy/strategy_fg/mca_strategy_fg.c`、`mca_hardware_ic/fuelgauge_ic/bq27z561/bq27z561.c`）
-> - 算法条件原文：TI **BQ27Z561-R2 / BQ27Z558 Technical Reference Manual (SLUUBO7) §4.4.2 QMax Update Conditions**
+> - 算法条件参考：TI **BQ27Z561-R2 / BQ27Z558 Technical Reference Manual (SLUUBO7) §4.4.2 QMax Update Conditions**
+
+> **芯片说明**：本机实测 `vendor=3`，按 Xiaomi 开源驱动 `bq27z561.c` 中的 `enum fg_vendor` 枚举对应 **MPC8011B**，并非 TI BQ27Z561。驱动文件名为 `bq27z561.c` 是因为它是多厂商兼容驱动。下文涉及 TI TRM 的算法条件**仅作为兼容架构参考**，MPC8011B 是否完整复用 TI 的全部 QMax 更新条件尚未通过其固件/资料确认。
+
+---
 
 ## 一、先分清几个容量数字（本机实测）
 
 | 字段 | 本机值 | 含义 |
 |---|---:|---|
 | `design_capacity` | 6000 mAh | 设计（标称）容量，来自设备树/电池包 |
-| `qmax` | 6057 mAh | 电量计算出的**真实满充容量**，只有它会触发 `charge_full` 变化 |
-| `charger_full` | 5797 mAh | 电量计当前上报的满充容量，Android 的 `charge_full` 就是它 |
+| `qmax` | 6057 mAh | 电量计学习得到的 **QMax（化学/无负载容量估计）**，是 FCC/SOC 计算的重要基础参数，但不等同于当前的 FullChargeCapacity |
+| `charger_full` | 5797 mAh | 电量计当前上报的 **FullChargeCapacity (FCC)**，Android 的 `charge_full` 就是它 |
 | `tfullchgq` | 5781 mAh | 另一路满充量记录（随工况小幅浮动） |
-| `soh` / `soh_new`（UI 显示） | 100 / 97 | 健康度；`soh_new` 即系统读的 `ui_soh` |
+| `soh` | 100 | FG 标准 SOH（StateOfHealth） |
+| `ui_soh` / `soh_new` | 97 | 厂商自定义 UI SOH，`soh_new` 即系统读的 `ui_soh` |
 | `cyclecount` | 390 | 总循环次数 |
-| `qmax_cyclecount` | 280 | 最近一次 Qmax 更新时的循环数（推断自驱动同块读取的字段顺序） |
+| `qmax_cyclecount` | 280 | 若该厂商字段遵循 TI QMaxCycles 语义，则为最近一次 QMax 更新时的循环数 |
 
-观察：`5797 ÷ 6000 ≈ 96.6%`，与 `soh_new = 97` 基本一致——即"电池健康 97%"与 `charge_full` 是同一件事的两种表述。
+### QMax 与 FCC 的关系
+
+TI 对两者的定义非常明确：
+
+- **QMax** 是通过 OCV（开路电压）和电荷积分等确定的 **chemical capacity**（化学容量），反映的是电池本身的化学活性总量。
+- **FullChargeCapacity (FCC)** 是根据 QMax + 阻抗模型 (Ra) + 温度 + 电压 + 电流/负载条件 **实时计算**出来的当前可用容量。
+
+$$ FCC = f(QMax,\ Ra,\ Temperature,\ Load,\ Voltage,\ \ldots) $$
+
+因此 QMax = 6057 并不代表"当前能充进 6057 mAh"，而 charger_full = 5797 才是当前工况下 FG 上报的 FCC。
+
+Xiaomi 源码也确认两者是独立字段：
+
+```c
+case FG_IC_PROP_QMAX:
+    fg_read_qmax(info, &val);   // 读 QMax
+
+case FG_IC_PROP_FCC:
+    fg_read_fcc(info, &val);    // 读 FullChargeCapacity
+```
+
+> 源码依据：`bq27z561.c`（`drivers/power/supply/mca/mca_hardware_ic/fuelgauge_ic/bq27z561/`）
+
+### SOH 与 charge_full 的关系
+
+`5797 ÷ 6000 ≈ 96.6%`，与 `ui_soh = 97` 高度吻合，说明 Xiaomi 的 UI SOH 很可能与当前容量衰减程度高度相关。
+
+但需要注意，这里至少存在**三套不同的 SOH 概念**：
+
+| 概念 | 说明 |
+|---|---|
+| `soh` (FG 标准 SOH) | TI BQ27Z561-R2 的 `StateOfHealth()`，使用固定初始环境温度 (25℃) 和配置的 SOH Load Rate 专门计算一个 `FCC_SOH`，以减少普通 FCC 因实时负载/温度变化造成的波动 |
+| `fcc_soh` | FG 的 SOH 专用 FCC，是标准 SOH 的中间产物 |
+| `ui_soh` (厂商 UI SOH) | 厂商自定义字段，Xiaomi 源码中 `fg_get_ui_soh()` 直接读取、`fg_store_ui_soh()` 可写入厂商 MAC `0x007B` |
+
+本机 `soh = 100` 而 `ui_soh = 97`，本身就证明它们不是同一个东西。`ui_soh` 属于厂商自定义字段，其完整计算公式尚未从闭源 HAL/FG 固件中确认，因此不能直接断言 `ui_soh = FCC / DesignCapacity`。
+
+---
 
 ## 二、谁决定 charge_full
 
-- 内核**不做**容量计算：`mca_battery_psy.c` 只把电量计的 `POWER_SUPPLY_PROP_CHARGE_FULL` 透传给 Android；`strategy_fg_get_soh_new()` 直接读电量计的 `ui_soh`。
-- 结论：**只有电量计自己完成一次 Qmax 更新，`charge_full` 才会变**。改 UI、改 HAL、改 MCA 都只会改显示，不会改这个值。
-- 校准是"重学"，不是"修正偏差"：新值上限受 `Qmax Upper Bound` 约束、单次变化幅度受 `Qmax Delta` 约束（见下节）。
+Android/MCA 层不自行估算 FCC。`mca_battery_psy.c` 只把电量计的 `POWER_SUPPLY_PROP_CHARGE_FULL` 透传给 Android；`strategy_fg_get_soh_new()` 直接读电量计的 `ui_soh`。
 
-## 三、触发条件（TI TRM 原文口径）
+但 **FCC 并不是 QMax 的简单复制，也不只在 QMax 更新时变化**。电量计根据 QMax、阻抗模型 (Ra)、温度、负载和充放电状态等**实时计算** FCC。TI TRM 的 FCC 章节列出了 FCC/RemCap/RSOC 的重新计算条件，包括：
 
-Qmax 更新需要**两次 OCV（开路电压）读数**，分别在一次充/放电活动的前后、电池处于 RELAXED 状态时取得：
+- QMax 更新
+- Ra 更新
+- 开始充电/放电
+- 有效充电终止
+- RELAX 中定期更新
+- 温度变化超过 5℃
+- 电流和累计电荷变化
+
+因此即使 QMax = 6057 完全不动，FCC 也完全可能从 5797 → 5760 → 5810 之类地变化。
+
+改 UI、改 HAL、改 MCA 都只会改显示，不会改 FCC 这个值——它由电量计芯片内部算法决定。
+
+---
+
+## 三、QMax 更新触发条件（TI TRM 参考）
+
+> 以下条件来自 TI BQ27Z561/BQ27Z561-R2 Impedance Track 算法，仅作为兼容架构参考。本机 `vendor=3` 按 Xiaomi 开源驱动枚举对应 MPC8011B，是否完整复用 TI 的所有 QMax 更新条件尚未通过 MPC8011B 固件/资料确认。
+
+QMax 更新需要**两次合格的 OCV（开路电压）读数**，分别在一次充/放电活动的前后、电池处于 RELAXED 状态时取得：
 
 - **RELAXED 判定**：电池电压 `dV/dt < 1 µV/s`；充满态通常需要**最多 2 小时**、放空态**最多 5 小时**才满足；超过 5 小时即使未满足也会取读数。
-- **必须有一次真实的充/放电活动**夹在两次静置之间——也就是一次完整的充放电循环。
+- **两次静置之间必须有足够的充/放电活动**——TI 要求容量变化 **≥ 37%** 设计容量。
 
-以下任一条件成立会**取消**这次 Qmax 更新：
+以下任一条件成立会**取消**这次 QMax 更新：
 
 | 取消条件 | 门槛（TRM 默认值） |
 |---|---|
@@ -47,21 +105,36 @@ Qmax 更新需要**两次 OCV（开路电压）读数**，分别在一次充/放
 更新幅度的两道边界检查：
 
 - `Qmax Delta`（默认 **5%** 设计容量）：单次更新最多变化这么多，超出会被截断。
-- `Qmax Upper Bound`（默认 **130%** 设计容量）：Qmax 终生不超过该上限。
+- `Qmax Upper Bound`（默认 **130%** 设计容量）：QMax 终生不超过该上限。
 
-## 四、本机状态（为什么现在没在校准）
+### 不要求 0→100% 完整循环
+
+TI 普通 QMax 更新的核心条件是**两次合格 OCV 之间容量变化 ≥ 37%**，并不要求从 0% 放到 100% 或完成一次完整循环。例如 90% → 40%（容量变化 50%），两端都有合格 OCV，一样可能完成 QMax 更新。
+
+此外 BQ27Z561-R2 还支持：
+- **Fast QMax**：可以只依赖一个 OCV，并在放电到 10% RSOC 以下时更新。
+- **Cycle Count Based QMax Degradation**：用于长期无法满足普通 QMax 条件的场景。
+
+> 以上均为 TI 算法描述，本机 MPC8011B 是否完全沿用尚待确认。
+
+---
+
+## 四、本机状态
 
 ```bash
 adb shell "su -c 'for n in qmax qmax_cyclecount cyclecount charger_full soh soh_new ui_soh learning_power learning_power_dev learning_time_dev design_capacity; do printf \"%-20s=\" \$n; cat /sys/class/xm_power/fg_master/\$n; done'"
 ```
 
-实测：`qmax=6057`、`qmax_cyclecount=280`、`cyclecount=390`、`charger_full=5797000`、`soh_new=97`、`learning_power=0`、`learning_power_dev=0`、`learning_time_dev=0`。
+实测：`qmax=6057`、`qmax_cyclecount=280`、`cyclecount=390`、`charger_full=5797000`、`soh=100`、`soh_new=97`、`learning_power=0`、`learning_power_dev=0`、`learning_time_dev=0`。
 
-- `learning_*` 全为 0 → **当前不在学习周期内**。
-- `qmax_cyclecount(280) < cyclecount(390)` → 已有约 110 个循环没有更新过 Qmax（推断）。
-- 设备芯片标识：`device_name=1XM31`、`vendor=3`、`eeprom_version=C`、`chip_ok=1`；驱动为 TI `bq27z561.ko`，但学习命令走定制寄存器（`NVT_FG_REG_START_LEARNING`），属 BQ27Z561 兼容的定制电量计。
+- `qmax_cyclecount(280) < cyclecount(390)`：若该厂商字段遵循 TI QMaxCycles 语义，则大约从 cycle 280 到现在 390 没有发生新的 QMax 更新。但本机驱动实际读取的是厂商 MAC `0x0071`（`FG_MAC_CMD_QMAX_CYCLECOUNT`），而非 TI 标准 `0x3A/0x3B`，因此该推断仍需注明限定条件。
+- 设备芯片标识：`device_name=1XM31`、`vendor=3`（MPC8011B）、`eeprom_version=C`、`chip_ok=1`；驱动文件名为 `bq27z561.ko`（多厂商兼容驱动），学习命令走定制寄存器。
 
-## 五、系统侧还有一个"主动学习"通道
+> **关于 `learning_*` 节点**：`learning_power`、`learning_power_dev`、`learning_time_dev` 在驱动中的真实定义为 `NVT_FG_REG_EST_POWER`（估算功率输入）、`NVT_FG_REG_POWER_DEV`（估算功率与实际功率偏差）、`NVT_FG_REG_TIME_DEV`（估算功率时间与实际时间偏差）。它们属于厂商"功率学习/估算"相关寄存器，**不是 QMax 学习状态位**。其值为 0 只说明这些估算量当前为 0，不能推出"当前是否处于 QMax 学习周期"。
+
+---
+
+## 五、厂商自定义"功率学习"接口（与 QMax 的关系未确认）
 
 `/sys/class/xm_power/fg_master/` 下有两个**可写**节点：
 
@@ -72,12 +145,64 @@ adb shell "su -c 'for n in qmax qmax_cyclecount cyclecount charger_full soh soh_
 
 证据：`/vendor/etc/init/vendor.xiaomi.hardware.micharge-service.rc` 明确 `chown system system .../start_learning`、`.../stop_learning`；`micharge-hal`（本机 pid 1932，running）二进制中含这些路径与 `qmax`、`soh`、`ui_soh` 字符串。
 
-要点（**推断**）：这只是"开一个学习窗口"，**能不能真正更新 Qmax 仍取决于第三节的物理条件**；HAL 触发学习的内部门槛在闭源实现里，未验证。
+源码确认 `fg_set_start_learning()` 会写 `NVT_FG_REG_START_LEARNING` 寄存器。但该寄存器周围的寄存器组包括：
+
+```
+START_LEARNING / STOP_LEARNING
+EST_POWER / ACT_POWER / POWER_DEV / TIME_DEV
+CONST_POWER / REF_POWER / REF_CURRENT
+START_LEARNING_B ...
+```
+
+从整个寄存器组的结构看，这明显更像厂商自己的**功率/续航预测学习机制**。它跟 TI QMax 更新所需的 `GaugingStatus` / `QEN` / `VOK` / `QMAX` / `OCV` / `Ra` 链路在现有开源驱动中看不到直接关联。
+
+因此：`start_learning` / `stop_learning` 确实控制厂商自定义学习寄存器，同时伴随 Estimated Power、Actual Power、Power Deviation、Time Deviation 等参数。从现有开源驱动**无法证明该机制用于 TI Impedance Track 的 QMax 学习**，暂不把它与 QMax 校准等同。
+
+---
 
 ## 六、实践结论
 
-- 想让它重新校准：一次**深度放电 → 充满到终止**的循环，且两次静置各自留够时间（充满态 ~2 h、放空态 ~5 h），全程 **10~40 ℃**。
-- **浅充浅放不会触发校准**：容量变化 < 37% 直接取消。把 SOC 限制在某个中间档（如 55%）长期使用，`charge_full` 基本不会更新。
-- 高温充电（> 40 ℃）、边充边用、频繁插拔都会让 OCV/温度条件不合格。
-- 校准是渐进的：即使成功，单次变化也被限制在 5% 设计容量以内，不会一次跳变。
+对标准 TI QMax 学习而言，提高成功概率的做法是让**两次充分静置之间产生足够大的 SOC/容量变化**（TI 参考门槛 ≥ 37%），并维持合适温度（10~40℃）；**不要求必须从 0% 放到 100% 或完成一次完整循环**。本机 MPC8011B 是否完全沿用该条件尚待确认。
 
+- **浅充浅放不会触发 QMax 校准**：容量变化 < 37% 会取消更新。把 SOC 限制在某个中间档（如 55%）长期使用，QMax 基本不会更新。
+- 高温充电（> 40℃）、边充边用、频繁插拔都会让 OCV/温度条件不合格。
+- 校准是渐进的：即使成功，单次变化也被限制在 5% 设计容量以内，不会一次跳变。
+- FCC 本身会因 QMax、Ra、温度、负载等实时变化，不需要等 QMax 更新就会波动。
+
+---
+
+## 附：QMax / FCC / SOH / learning 关系总览
+
+```
+                 ┌── QMax
+                 │
+FG 内部模型 ─────┼── Ra / 阻抗
+                 ├── 温度
+                 ├── 负载 / 电流
+                 ↓
+          FullChargeCapacity (FCC)
+                 │
+                 └── Android charge_full
+
+
+TI 标准 SOH：
+  QMax + Ra + 固定 SOH 工况 (25℃, SOH Load Rate)
+        ↓
+      FCC_SOH
+        ↓
+       SOH
+
+
+Xiaomi UI SOH：
+  厂商自定义算法
+        ↓
+      ui_soh
+        ↓
+      soh_new
+
+
+start_learning / learning_power：
+  厂商自定义功率学习机制
+        ↓
+  目前无证据证明 = QMax Learning
+```
