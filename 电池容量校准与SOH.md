@@ -166,6 +166,8 @@ adb shell "su -c 'for n in qmax qmax_cyclecount cyclecount charger_full soh soh_
 
 ## 五、厂商自定义"功率学习"接口（与 QMax 的关系未确认）
 
+### 5.1 可写节点
+
 `/sys/class/xm_power/fg_master/` 下有两个**可写**节点：
 
 | 节点 | 权限 | 作用 |
@@ -173,9 +175,9 @@ adb shell "su -c 'for n in qmax qmax_cyclecount cyclecount charger_full soh soh_
 | `start_learning`（及 `_b`） | `rw-rw-r-- system system` | 向 `NVT_FG_REG_START_LEARNING` 写 `0x01`；用于厂商自定义 learning 机制，具体状态机语义未公开 |
 | `stop_learning`（及 `_b`） | `rw-rw-r-- system system` | 向 `NVT_FG_REG_STOP_LEARNING` 写 `0x01`；具体结束行为由厂商 FG 固件定义 |
 
-证据：`/vendor/etc/init/vendor.xiaomi.hardware.micharge-service.rc` 明确 `chown system system .../start_learning`、`.../stop_learning`；`micharge-hal`（本机 pid 1932，running）二进制中含这些路径与 `qmax`、`soh`、`ui_soh` 字符串。
+### 5.2 内核侧：寄存器结构证据
 
-源码确认 `fg_set_start_learning()` 会写 `NVT_FG_REG_START_LEARNING` 寄存器。但该寄存器周围的寄存器组包括：
+源码确认 `fg_set_start_learning()` 会写 `NVT_FG_REG_START_LEARNING` 寄存器。该寄存器周围的寄存器组包括：
 
 ```
 START_LEARNING / STOP_LEARNING
@@ -184,9 +186,228 @@ CONST_POWER / REF_POWER / REF_CURRENT
 START_LEARNING_B ...
 ```
 
-从整个寄存器组的结构看，这明显更像厂商自己的**功率/续航预测学习机制**。它跟 TI QMax 更新所需的 `GaugingStatus` / `QEN` / `VOK` / `QMAX` / `OCV` / `Ra` 链路在现有开源驱动中看不到直接关联。
+从整个寄存器组的结构看，这更像厂商自己的**功率/续航预测学习机制**。它跟 TI QMax 更新所需的 `GaugingStatus` / `QEN` / `VOK` / `QMAX` / `OCV` / `Ra` 链路在现有开源驱动中看不到直接关联。
 
-因此：`start_learning` / `stop_learning` 确实控制厂商自定义学习寄存器，同时伴随 Estimated Power、Actual Power、Power Deviation、Time Deviation 等参数。从现有开源驱动**无法证明该机制用于 TI Impedance Track 的 QMax 学习**，暂不把它与 QMax 校准等同。
+### 5.3 内核侧：SM8550 属性枚举结构证据
+
+在较早的 Xiaomi/Qualcomm 开源内核（SM8550 `qti_battery_charger.c`）中，这些属性明确被归在同一功能块：
+
+```c
+/*********nvt fuelgauge feature*********/
+XM_PROP_START_LEARNING,
+XM_PROP_STOP_LEARNING,
+XM_PROP_SET_LEARNING_POWER,
+XM_PROP_GET_LEARNING_POWER,
+XM_PROP_GET_LEARNING_POWER_DEV,
+XM_PROP_GET_LEARNING_TIME_DEV,
+XM_PROP_SET_CONSTANT_POWER,
+XM_PROP_GET_REMAINING_TIME,
+XM_PROP_SET_REFERANCE_POWER,
+XM_PROP_GET_REFERANCE_CURRENT,
+XM_PROP_GET_REFERANCE_POWER,
+XM_PROP_START_LEARNING_B,
+XM_PROP_STOP_LEARNING_B,
+XM_PROP_SET_LEARNING_POWER_B,
+XM_PROP_GET_LEARNING_POWER_B,
+XM_PROP_GET_LEARNING_POWER_DEV_B,
+```
+
+而 QMax/FCC/SOH 是紧接着的**另一组独立属性**：
+
+```c
+XM_PROP_FG1_QMAX,
+XM_PROP_FG1_RM,
+XM_PROP_FG1_FCC,
+XM_PROP_FG1_SOH,
+XM_PROP_FG1_FCC_SOH,
+...
+```
+
+这已经是较强的结构证据：`START_LEARNING` 这一组高度像 NVT/MPC 电量计的功率/续航预测学习，而非 TI QMax learning。
+
+> 源码依据：LineageOS SM8550 `qti_battery_charger.c`
+
+### 5.4 HAL 侧：micharge-hal 二进制 strings 实测
+
+对本机 `/vendor/bin/hw/vendor.xiaomi.hardware.micharge-service`（119472 字节，AARCH64 PIE）做 strings 提取（631 条），关键发现：
+
+**功率学习相关字符串聚类（在 strings 输出中紧密相邻）：**
+
+```
+start_learning
+stop_learning
+remaining_time
+nvt_referance_power
+nvt_referance_current
+referance_power
+referance_current
+constant_power
+action_power
+learning_power
+learning_power_dev
+learning_time_dev
+power_deviation
+current_deviation
+calc_rvalue
+```
+
+**HAL 内部函数名（直接可见）：**
+
+```
+Entry set_cycle_power function, tid is %d    ← set_cycle_power 入口
+set_cycle_power function is exitd!            ← set_cycle_power 退出
+Entry unset_cycle_power                       ← unset_cycle_power 入口
+set_learn_power                               ← 设置学习功率
+get_learn_power                               ← 读取学习功率
+get_learn_power_dev                           ← 读取功率偏差
+get_learn_power_dev_b
+get_learn_time_dev                            ← 读取时间偏差
+start_learn_b / stop_learn_b
+learn_power_b
+screenStateChanged                            ← 屏幕状态变化（疑似触发条件之一）
+```
+
+**QMax/SOH 相关字符串（存在于 HAL 中，但通过不同路径访问）：**
+
+```
+/sys/class/xm_power/fg_master/qmax
+/sys/class/xm_power/fg_master/qmax_cyclecount
+/sys/class/xm_power/fg_master/soh
+/sys/class/xm_power/fg_master/ui_soh
+/sys/class/xm_power/fg_master/rel_soh
+/sys/class/xm_power/fg_master/eis_soh
+/sys/class/xm_power/fg_master/cyclecount
+/sys/class/power_supply/battery/charge_full
+```
+
+**关键观察**：HAL 二进制中 `start_learning` 周围**没有出现**任何 TI QMax 学习相关字符串（`relax`、`ocv`、`QEN`、`VOK`、`GaugingStatus`、`impedance`、`ra_table`），而全部是功率/时间/偏差/参考电流等功率学习参数。
+
+### 5.5 HAL 侧：init rc 文件分组证据
+
+`vendor.xiaomi.hardware.micharge-service.rc` 中 `chown` 块的节点排列同样呈现分组特征：
+
+```
+# 功率学习组（连续排列）
+start_learning
+stop_learning
+learning_power
+action_power
+learning_power_dev
+learning_time_dev
+constant_power
+remaining_time
+referance_power
+referance_current
+nvt_referance_power
+start_learning_b / stop_learning_b / learning_power_b / learning_power_dev_b
+
+# 容量/SOH 组（另一段）
+qmax
+qmax_cyclecount
+soh / ui_soh
+rel_soh / eis_soh
+rel_soh_cyclecount / eis_soh_cyclecount
+```
+
+### 5.6 HAL 侧：NDK 接口定义
+
+HAL 的 NDK 接口库 `vendor.xiaomi.hardware.micharge-V2-ndk.so` 导出的 AIDL 方法列表中，`start_learning` 等节点通过通用键值接口访问，而非专门方法：
+
+- `getBatteryCommonInfo(key)` / `setBatteryCommonInfo(key, value)`：通用键值读写，`start_learning` 等功率学习节点通过此接口操作
+- `getBatteryChargeFull()` / `getBatterySoh()` / `getBatteryCycleCount()`：独立的 QMax/FCC/SOH 读取方法
+
+这说明 QMax/FCC/SOH 与功率学习在 HAL 接口层面也是分离的。
+
+### 5.7 动态追踪：strace 初步结果
+
+对本机 micharge-hal（PID 1932）进行 60 秒 strace 跟踪（`openat/read/write`），在手机空闲状态下：
+
+- HAL 仅反复读取 `reverse_chg_mode`、`fast_charge`、`real_type`（轮询充电状态）
+- **未观察到**对 `start_learning`、`learning_power`、`qmax`、`charger_full` 等节点的访问
+
+这说明 `start_learning` 不是 HAL 的常规轮询节点，而是在特定条件下（如 `set_cycle_power` 被调用、`screenStateChanged` 触发等）才会访问。
+
+### 5.8 结论
+
+综合内核寄存器结构、SM8550 属性枚举分组、HAL 二进制 strings 聚类、rc 文件分组、NDK 接口分离和动态追踪，判断更新为：
+
+**大概率（约 90%+）`start_learning` 是 NVT/MPC 电量计的功率/续航预测学习机制，而非 TI Impedance Track 的 QMax learning。**
+
+要将剩余不确定性消除到接近 100%，还需要：
+- 用 Ghidra 反编译 micharge-hal，找到 `start_learning` 字符串的 XREF，追踪其 caller 和条件判断逻辑
+- 或在充放电场景下长时间 strace，抓到 HAL 实际写 `start_learning` 的时间序列和前后访问的节点
+
+### 5.9 后续求证方法
+
+**方法一：Ghidra 静态反编译**
+
+```bash
+# 已拉取的二进制
+vendor.xiaomi.hardware.micharge-service  # 119472 bytes, AARCH64 PIE
+
+# Ghidra 分析步骤
+# 1. 导入：AARCH64 / ARM64 little endian
+# 2. Search → For Strings → 搜索 "start_learning"
+# 3. 找到后 → References → Show References To
+# 4. 追踪调用链：writeSysfs("/sys/.../start_learning", "1") → caller → 条件判断
+# 5. 重点看 caller 中是否有 qmax/ocv/relax/ra 相关路径
+```
+
+关键判断标准：
+
+| 反编译发现 | 对 QMax 关联的证据强度 |
+|---|---|
+| `qmax` / `qmax_cyclecount` 路径 | 强 |
+| `fcc` / `charger_full` | 中等 |
+| `ocv` / `relax` / `relaxed` | 强 |
+| `GaugingStatus` / `QEN` / `VOK` | 非常强 |
+| `DOD` / `passed charge` / `Ra table` | 强 |
+| 温度 10~40℃ 判断 | 中等 |
+| SOC Δ / capacity delta 判断 | 强 |
+| 只看到 power / time / reference current | **反向证据很强** |
+
+**方法二：动态 strace 长时间跟踪**
+
+```bash
+# 找 PID
+adb shell su -c 'pidof vendor.xiaomi.hardware.micharge-service'
+
+# 跟踪文件读写
+adb shell su -c '
+  strace -ff \
+    -e trace=openat,read,write \
+    -s 256 \
+    -p $(pidof vendor.xiaomi.hardware.micharge-service) \
+    -o /data/local/tmp/micharge_trace
+'
+
+# 正常使用手机一段时间后拉取
+adb pull /data/local/tmp/micharge_trace.<pid>
+```
+
+**方法三：sysfs 实时监控（不修改任何寄存器）**
+
+```bash
+adb shell su -c '
+while true; do
+    echo -n "$(date +%H:%M:%S) "
+    for n in \
+        qmax qmax_cyclecount cyclecount charger_full soh soh_new \
+        start_learning stop_learning learning_power learning_power_dev \
+        learning_time_dev remaining_time referance_power referance_current \
+        action_power constant_power power_deviation current_deviation
+    do
+        printf "%s=" "$n"
+        cat /sys/class/xm_power/fg_master/$n 2>/dev/null
+        printf " "
+    done
+    echo
+    sleep 5
+done
+'
+```
+
+不主动 `echo 1 > start_learning`，先观察系统自然触发。
 
 ---
 
@@ -244,11 +465,22 @@ charger_full 发生变化
 
 ## 七、后续研究方向
 
+### 7.1 QMax 更新追踪
+
 当前最值得追的线索是 `qmax_cyclecount=280` 与 `cyclecount=390` 的差异：若 MAC `0x0071` 在 MPC8011B 上确实表示 QMaxCycles，则该设备已约 110 个循环没有发生 QMax 更新。
 
 后续可以研究：
 - 为什么 K80 Pro 长期没有触发 QMax update——是使用习惯（长期浅充浅放）导致，还是 MPC8011B 的触发条件与 TI 不同？
 - 能否从 `qmax` / `qmax_cyclecount` 的实时变化设计实验，证实 MPC8011B 的实际学习条件。
+
+### 7.2 start_learning 机制确认
+
+第五节已汇总了多层证据（内核寄存器结构、SM8550 属性枚举、HAL strings 聚类、rc 文件分组、NDK 接口分离、strace 初步结果），当前判断为约 90%+ 概率是功率/续航学习机制。
+
+要消除剩余不确定性，优先级最高的操作：
+1. 用 Ghidra 反编译 micharge-hal，追踪 `start_learning` 的 XREF 调用链和 caller 条件判断
+2. 在充放电场景下长时间 strace，抓取 HAL 实际写 `start_learning` 的时间序列和前后访问的节点
+3. 结合 sysfs 实时监控，观察 `start_learning` 触发时 `qmax` / `qmax_cyclecount` 是否同步变化
 
 ---
 
