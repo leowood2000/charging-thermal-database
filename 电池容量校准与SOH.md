@@ -459,6 +459,80 @@ charger_full 发生变化
 
 这才是当前真正有价值的下一层——从"HAL 不主动触发"推进到"上层在什么条件下触发，触发后 FG 内部到底变了什么"。
 
+### 7.3 MPC8011B 固件提取可行性评估
+
+#### 固件文件搜索结果
+
+**确证：手机系统中不存在可直接提取的 MPC8011B 程序固件文件。**
+
+1. 在 `/vendor`、`/odm`、`/system_ext`、`/product` 全分区搜索 `.bin`/`.fw`/`.hex`/`.img`/`.dat` 格式的燃料计固件文件——**无结果**。
+2. `/vendor/firmware/` 目录仅含 GPU/Camera/WiFi 固件，无燃料计相关项。
+3. `/vendor/firmware_mnt/image/peach/` 目录下发现 `bd_o1gl.elf`——经确认为高通 WiFi/蓝牙模块固件（ARM 32-bit ELF，peach 是 WCN685x 代号），**与 MPC8011B 无关**。
+4. micharge-service 中的 `o1gG020FwUpgrade`/`o1gF103FwUpgrade` 固件升级流程——经确认为**无线充电芯片**固件升级（通过 `/dev/hidraw%d` HIDRAW 接口通信，非 I2C），**与 MPC8011B 无关**。
+5. 内核驱动 `bq27z561.c` 中的 `fg_update_record_voltage_level()` 函数仅做 Data Flash 参数级更新（unseal → 读写 MAC 命令 → seal），不含 `request_firmware()` 调用，不加载完整程序固件。
+
+**结论**：MPC8011B 的 QMax 学习算法固化在芯片内部，无法通过软件分区提取。这与昂科烧录器支持列表中 MPC8011B 存在生产烧录流程但"能烧录 ≠ 用户可读回程序 Flash"的判断一致。
+
+#### 当前可访问的 MPC8011B 信息层
+
+虽然无法提取程序固件，但通过 sysfs 和设备树获取了以下确证信息：
+
+| 信息来源 | 节点 | 当前值 | 说明 |
+|---|---|---|---|
+| sysfs | `vendor` | 3 | vendor=3 → MPC8011B（NVT 路径） |
+| sysfs | `device_name` | 1XM31 | 电芯型号 |
+| sysfs | `eeprom_version` | C | Data Flash 版本 |
+| sysfs | `seal` | 3 | 当前 seal 状态（3=sealed） |
+| sysfs | `df_check` | 33001 | Data Flash 校验值 |
+| sysfs | `qmax` | 6057 | QMax（单位 mAh，设计容量 6000） |
+| sysfs | `qmax_cyclecount` | 280 | QMax 更新时的循环数 |
+| sysfs | `cyclecount` | 390 | 当前总循环数 |
+| sysfs | `tfullchgq` | 5780 | FCC（满充电荷量） |
+| sysfs | `tremq` | 2626~2630 | RM（剩余电荷量） |
+| sysfs | `soh` | 100 | TI 标准 SOH |
+| sysfs | `soh_new` | 97 | 厂商 SOH |
+| sysfs | `ui_soh` | `97 119 1 2 97 100 100 100 100 100 207` | UI SOH 11 字节块（MAC 0x007B） |
+| sysfs | `fcc_soh` | 0 | FCC SOH（未启用/未计算） |
+| sysfs | `dod_count` | 0 | DoD 计数 |
+| sysfs | `start_learning` | 0 | 当前未在学习中 |
+| sysfs | `learning_power` | 0 | 学习功率（空闲时为 0） |
+| sysfs | `cutoff_vol` | 3050 | 当前截止电压（mV，对应 29℃ 档） |
+| sysfs | `charger_full` | 5797000 | charger_full（μAh） |
+| sysfs | `design_capacity` | 6000000 | 设计容量（μAh） |
+| 设备树 | `model-name` | `O11U_6000mah_120w` | 国行电池模型 |
+| 设备树 | `model-name-global` | `O11U_5300mah_120w` | 全球版电池模型 |
+| 设备树 | `charge-full-design` | 6000 | 设计满充容量（mAh） |
+| 设备树 | `vcutoff_fw` | 3050 | 固件截止电压（mV，29~60℃） |
+| 设备树 | `vcutoff_sw` | 2900 | 软件截止电压（mV，29~60℃） |
+| 设备树 | `vcutoff_shutdown_delay` | 3050 | 延迟关机截止电压（mV） |
+| 设备树 | `report-full-rsoc` | 9500 | 报满充 RSOC 门槛（95%） |
+| 设备树 | `soc-proportion` | 95 | SOC 比例（国行） |
+| 设备树 | `soc-proportion-c` | 94 | SOC 比例 C 值 |
+| 设备树 | `fg_hightemp_vterm` | 4200 | 高温终止电压（mV） |
+| 设备树 | `adapt_power` | 120 | 适配功率（W？） |
+| 设备树 | `bq,shutdown-delay-enable` | (空) | 关机延迟未启用 |
+| 设备树 | `terminated_by_cp` | 1 | 由充电泵终止充电 |
+
+#### MAC/Data Flash 枚举的可行性
+
+**I2C 直接访问：不可行。** `/dev/i2c-*` 设备节点不存在，MPC8011B 的 I2C 访问完全由内核驱动封装。
+
+**debugfs：不可用。** debugfs 未挂载，无燃料计 debug 节点。
+
+**sysfs 节点：已穷举。** `fg_master` 下共 83 个节点，全部已列出并读取。这些节点是内核驱动从 MPC8011B MAC 寄存器读取后暴露的，但只覆盖了驱动已知的 MAC 地址，无法自由枚举未知 MAC。
+
+**dmesg：循环日志已被覆盖。** 仅保留运行时 `fg_update_status` 周期日志，无初始化阶段的芯片 ID / MAC 枚举记录。
+
+**结论**：在不修改内核驱动或加载自定义内核模块的前提下，无法自由枚举 MPC8011B 的 MAC 地址空间。现有 83 个 sysfs 节点是当前能获取的最大信息面。
+
+#### 实机触发实验方案
+
+既然固件提取和 MAC 枚举均不可行，最现实的确认路径是**实机触发实验**：
+
+1. **QMax 更新实验**：执行一次完整的 OCV1 → 放电 ≥37% → OCV2 流程，实时监控 `qmax`/`qmax_cyclecount` 变化
+2. **start_learning 抓取**：充电时监控 `start_learning` 从 0→1→0 的完整周期，同步记录 `learning_power`/`learning_power_dev`/`remaining_time` 前后值
+3. **数据对比**：`start_learning` 周期结束后，检查 `qmax`/`qmax_cyclecount` 是否同步变化——若不变，进一步确认 start_learning 与 QMax 无直接关系
+
 ---
 
 ## 附：QMax / FCC / SOH / learning 关系总览
@@ -501,6 +575,9 @@ start_learning / learning_power：
   触发后写 /sys/class/xm_power/fg_master/start_learning = 1
     ↓
   尚未发现与 QMax 更新链路的直接联系（需 MPC8011B 固件确认）
+  MPC8011B 程序固件无法从软件分区提取（确证）
+  MAC 地址空间无法自由枚举（确证，I2C 设备节点不存在、debugfs 未挂载）
+  剩余路径：实机触发实验（监控 qmax/learning_power 同步变化）
 
 
 FCC 重新计算（自动发生，不等同于校准）：
